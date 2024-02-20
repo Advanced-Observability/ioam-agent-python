@@ -1,17 +1,38 @@
-import sys
-import os
-import os.path
 import getopt
-import socket
 import grpc
 import ioam_api_pb2
 import ioam_api_pb2_grpc
+import os
+import os.path
+import sys
+
 from bitstruct import unpack
+from enum import Enum
+from pyroute2.netlink import genlmsg
+from pyroute2.netlink.event import EventSocket
+from pyroute2.netlink.nlsocket import Marshal
 
-ETH_P_IPV6 = 0x86DD
+IOAM6_GENL_NAME = 'IOAM6'
 
-IPV6_TLV_IOAM = 49
-IOAM_PREALLOC_TRACE = 0
+class IoamGenlEvent(Enum):
+	IOAM6_EVENT_UNSPEC = 0
+	IOAM6_EVENT_TRACE = 1
+
+class ioam_msg(genlmsg):
+	nla_map = (
+		('IOAM6_EVENT_ATTR_UNSPEC', 'none'),
+		('IOAM6_EVENT_ATTR_TRACE_NAMESPACE', 'uint16'),
+		('IOAM6_EVENT_ATTR_TRACE_NODELEN', 'uint8'),
+		('IOAM6_EVENT_ATTR_TRACE_TYPE', 'uint32'),
+		('IOAM6_EVENT_ATTR_TRACE_DATA', 'cdata'),
+	)
+
+class MarshalIoamEvent(Marshal):
+	msg_map = { x.value: ioam_msg for x in IoamGenlEvent }
+
+class IoamEventSocket(EventSocket):
+	marshal_class = MarshalIoamEvent
+	genl_family = IOAM6_GENL_NAME
 
 TRACE_TYPE_BIT0_MASK  = 1 << 23	# Hop_Lim + Node Id (short)
 TRACE_TYPE_BIT1_MASK  = 1 << 22	# Ingress/Egress Ids (short)
@@ -27,7 +48,7 @@ TRACE_TYPE_BIT10_MASK = 1 << 13	# Namespace Data (wide)
 TRACE_TYPE_BIT11_MASK = 1 << 12	# Buffer Occupancy
 TRACE_TYPE_BIT22_MASK = 1 << 1	# Opaque State Snapshot
 
-def parse_node_data(p, ttype):
+def parse_trace_node(p, ttype):
 	node = ioam_api_pb2.IOAMNode()
 
 	i = 0
@@ -70,128 +91,97 @@ def parse_node_data(p, ttype):
 
 	return node
 
-def parse_ioam_trace(p):
+def parse_ioam_trace(event):
 	try:
-		ns, nodelen, _, remlen, ttype = unpack(">u16u5u4u7u24", p[:8])
+		namespace_id = event.get('IOAM6_EVENT_ATTR_TRACE_NAMESPACE')
+		node_len = event.get('IOAM6_EVENT_ATTR_TRACE_NODELEN')
+		ttype = event.get('IOAM6_EVENT_ATTR_TRACE_TYPE') >> 8
+		tdata = event.get('IOAM6_EVENT_ATTR_TRACE_DATA')
 
 		nodes = []
-		i = 8 + remlen * 4
 
-		while i < len(p):
-			node = parse_node_data(p[i:i+nodelen*4], ttype)
-			i += nodelen * 4
+		i = 0
+		while i < len(tdata):
+			node = parse_trace_node(tdata[i:i+node_len*4], ttype)
+			i += node_len*4
 
 			if ttype & TRACE_TYPE_BIT22_MASK:
-				opaque_len, node.OSS.SchemaId = unpack(">u8u24",
-									p[i:i+4])
-				if opaque_len > 0:
-					node.OSS.Data = p[i+4:i+4+opaque_len*4]
+				oss_len, node.OSS.SchemaId = unpack(
+					">u8u24", tdata[i:i+4])
 
-				i += 4 + opaque_len * 4
+				if oss_len > 0:
+					node.OSS.Data = tdata[i+4:i+4+oss_len*4]
+
+				i += 4+oss_len*4
 
 			nodes.insert(0, node)
 
 		trace = ioam_api_pb2.IOAMTrace()
-		trace.BitField = ttype << 8
-		trace.NamespaceId = ns
+		trace.BitField = ttype
+		trace.NamespaceId = namespace_id
 		trace.Nodes.extend(nodes)
 
 		return trace
 	except:
 		return None
 
-def parse(p):
+def report_event(func, event):
 	try:
-		nextHdr = p[6]
-		if nextHdr != socket.IPPROTO_HOPOPTS:
-			return None
+		if event.get('cmd') == IoamGenlEvent.IOAM6_EVENT_TRACE.value:
+			parsed_event = parse_ioam_trace(event)
+		else:
+			parsed_event = None
 
-		hbh_len = (p[41] + 1) << 3
-		i = 42
-
-		traces = []
-		while hbh_len > 0:
-			opt_type, opt_len = unpack(">u8u8", p[i:i+2])
-			opt_len += 2
-
-			if (opt_type == IPV6_TLV_IOAM and
-			    p[i+3] == IOAM_PREALLOC_TRACE):
-
-				trace = parse_ioam_trace(p[i+4:i+opt_len])
-				if trace is not None:
-					traces.append(trace)
-
-			i += opt_len
-			hbh_len -= opt_len
-
-		return traces
-	except:
-		return None
-
-def report_ioam(func, traces):
-	try:
-		for trace in traces:
-			func(trace)
+		if parsed_event is not None:
+			func(parsed_event)
 	except grpc.RpcError as e:
 		# TODO IOAM collector is probably not online
 		pass
 
-def listen(interface, collector):
-	try:
-		sock, stub, func = None, None, None
+def receive_ioam_events(collector):
+	stub, func = None, None
 
-		sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM,
-				     socket.htons(ETH_P_IPV6))
+	if collector is None:
+		func = print
+		print("[IOAM Agent] Printing IOAM events...")
+	else:
+		channel = grpc.insecure_channel(collector)
+		stub = ioam_api_pb2_grpc.IOAMServiceStub(channel)
+		func = stub.Report
+		print("[IOAM Agent] Reporting to the IOAM collector...")
 
-		sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
-				interface.encode())
+	ioam_events = IoamEventSocket()
 
-		if collector is None:
-			func = print
-			print("[IOAM Agent] Printing IOAM traces...")
-		else:
-			channel = grpc.insecure_channel(collector)
-			stub = ioam_api_pb2_grpc.IOAMServiceStub(channel)
-			func = stub.Report
-			print("[IOAM Agent] Reporting to IOAM collector...")
+	while True:
+		try:
+			for event in ioam_events.get():
+				report_event(func, event)
+		except KeyboardInterrupt:
+			print("[IOAM Agent] Closing...")
+			break
+		except OSError as e:
+			if e.args[0] == 105: #no buffer space available
+				print(str(e))
+				continue
+			print("[IOAM Agent] Closing on error: "+ str(e))
+			break
+		except Exception as e:
+			print("[IOAM Agent] Closing on error: "+ str(e))
+			break
 
-		while True:
-			traces = parse(sock.recv(2048))
-			if traces is not None and len(traces) > 0:
-				report_ioam(func, traces)
-	except KeyboardInterrupt:
-		print("[IOAM Agent] Closing...")
-	except Exception as e:
-		print("[IOAM Agent] Closing on unexpected error: "+ str(e))
-	finally:
-		if stub is not None:
-			channel.close()
-		if sock is not None:
-			sock.close()
+	if stub is not None:
+		channel.close()
 
 def help():
-	print("Syntax: "+ os.path.basename(__file__) +" -i <interface> [-o]")
-
-def help_str(err):
-	print(err)
-	help()
-
-def interface_exists(interface):
-	try:
-		socket.if_nametoindex(interface)
-		return True
-	except OSError:
-		return False
+	print("Syntax: "+ os.path.basename(__file__) +" [-o]")
 
 def main(script, argv):
 	try:
-		opts, args = getopt.getopt(argv, "hi:o",
-					   ["help", "interface=", "output"])
+		opts, args = getopt.getopt(argv, "ho", ["help", "output"])
 	except getopt.GetoptError:
 		help()
 		sys.exit(1)
 
-	interface = ""
 	output = False
 
 	for opt, arg in opts:
@@ -199,19 +189,12 @@ def main(script, argv):
 			help()
 			sys.exit()
 
-		if opt in ("-i", "--interface"):
-			interface = arg
-
 		if opt in ("-o", "--output"):
 			output = True
 
-	if not interface_exists(interface):
-		help_str("Unknown interface "+ interface)
-		sys.exit(1)
-
 	try:
 		collector = os.environ['IOAM_COLLECTOR'] if not output else None
-		listen(interface, collector)
+		receive_ioam_events(collector)
 	except KeyError:
 		print("IOAM collector is not defined")
 		sys.exit(1)

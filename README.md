@@ -1,5 +1,7 @@
 # IOAM Agent for Python3
 
+**Important note: this version uses Netlink Events to receive IOAM data. It is available only for recent kernel versions (>= 6.9).**
+
 1) Install dependencies:
 ```
 sudo pip3 install --upgrade bitstruct grpcio grpcio-tools protobuf
@@ -15,7 +17,7 @@ python3 -m grpc_tools.protoc -Iioam-api/ --python_out=. --grpc_python_out=. ioam
 
 3) Run it:
 ```[bash]
-sudo python3 ioam-agent.py -i <interface> [-o]
+sudo python3 ioam-agent.py [-o]
 ```
 
 ### Output Mode
